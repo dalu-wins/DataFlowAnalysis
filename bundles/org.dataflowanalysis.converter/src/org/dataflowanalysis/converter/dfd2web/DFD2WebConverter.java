@@ -66,17 +66,22 @@ public class DFD2WebConverter extends Converter {
                     .getSimpleName());
             throw new IllegalArgumentException("Invalid input for Model Conversion");
         }
-        
+
         var complete = dfdModel.get();
         var constraints = this.constraints.orElse(null);
         var finderClass = this.transposeFlowGraphFinder.orElse(null);
-        var violationTuples = analyzeViolations(complete, constraints, finderClass);
-        
-        WebEditorDfd webEditorDfd = processDfd(dfdModel.get()
-                .dataFlowDiagram(),
-                dfdModel.get()
-                        .dataDictionary(),
-                createNodeAnnotationMap(complete, constraints, finderClass, violationTuples),
+
+        // Evaluate TFGs exactly once so that hashCode() is stable across all uses
+        var evaluatedGraphs = getTransposeFlowGraphs(complete, finderClass).stream()
+                .map(AbstractTransposeFlowGraph::evaluate)
+                .toList();
+
+        var violationTuples = analyzeViolations(evaluatedGraphs, constraints);
+
+        WebEditorDfd webEditorDfd = processDfd(
+                complete.dataFlowDiagram(),
+                complete.dataDictionary(),
+                createNodeAnnotationMap(complete, evaluatedGraphs, violationTuples),
                 violationTuples);
         return new WebEditorConverterModel(webEditorDfd);
     }
@@ -111,73 +116,59 @@ public class DFD2WebConverter extends Converter {
      * Annotations include label propagation information for each vertex as well as violation
      * markers for any constraint violations found in the provided violation tuples.
      * @param complete DFD / DD combination
-     * @param constraints List of constraints (optional)
-     * @param finderClass Custom TFG finder class (optional)
+     * @param evaluatedGraphs Pre-evaluated list of transpose flow graphs (shared with violation analysis)
      * @param violationTuples Pre-computed list of constraint violations
      * @return Map from each {@link Node} to its list of {@link Annotation} objects
      */
-    private Map<Node, List<Annotation>> createNodeAnnotationMap(DataFlowDiagramAndDictionary complete, 
-            List<AnalysisConstraint> constraints,
-            Class<? extends TransposeFlowGraphFinder> finderClass,
+    private Map<Node, List<Annotation>> createNodeAnnotationMap(DataFlowDiagramAndDictionary complete,
+            List<? extends AbstractTransposeFlowGraph> evaluatedGraphs,
             List<ViolationTuple> violationTuples) {
 
-		Map<Node, List<Annotation>> mapNodeToAnnotations = new HashMap<>();
-		
-		var tfgResults = getTransposeFlowGraphs(complete, finderClass).stream()
-			.map(AbstractTransposeFlowGraph::evaluate)
-			.toList();
-		
-		complete.dataFlowDiagram().getNodes().forEach(node -> mapNodeToAnnotations.put(node, new ArrayList<>()));
-		
-		tfgResults.forEach(tfg -> tfg.getVertices().forEach(vertex -> {
-			var node = (Node) vertex.getReferencedElement();
-			mapNodeToAnnotations.get(node).addAll(createLabelAnnotationsForOneVertex((AbstractVertex<Node>) vertex, tfg.hashCode()));
-		}));
-		
-		for (ViolationTuple tuple : violationTuples) {
-			String constraintName = tuple.constraint().getName();
-			String message = "Constraint " + constraintName + " violated";
-			String color = stringToColorHex(constraintName);
-			int tfgHash = tuple.result().getTransposeFlowGraph().hashCode();
-			
-			tuple.result().getMatchedVertices().forEach(vertex -> {
-				Node node = (Node) vertex.getReferencedElement();
-				mapNodeToAnnotations.get(node).add(new Annotation(message, "bolt", color, tfgHash));
-			});
-		}
-		
-		return mapNodeToAnnotations;
-	}
-    
+        Map<Node, List<Annotation>> mapNodeToAnnotations = new HashMap<>();
+
+        complete.dataFlowDiagram().getNodes().forEach(node -> mapNodeToAnnotations.put(node, new ArrayList<>()));
+
+        evaluatedGraphs.forEach(tfg -> tfg.getVertices().forEach(vertex -> {
+            var node = (Node) vertex.getReferencedElement();
+            mapNodeToAnnotations.get(node).addAll(createLabelAnnotationsForOneVertex((AbstractVertex<Node>) vertex, tfg.hashCode()));
+        }));
+
+        for (ViolationTuple tuple : violationTuples) {
+            String constraintName = tuple.constraint().getName();
+            String message = "Constraint " + constraintName + " violated";
+            String color = stringToColorHex(constraintName);
+            int tfgHash = tuple.result().getTransposeFlowGraph().hashCode();
+
+            tuple.result().getMatchedVertices().forEach(vertex -> {
+                Node node = (Node) vertex.getReferencedElement();
+                mapNodeToAnnotations.get(node).add(new Annotation(message, "bolt", color, tfgHash));
+            });
+        }
+
+        return mapNodeToAnnotations;
+    }
+
     /**
-     * Analyzes the given data flow diagram for constraint violations.
+     * Analyzes the given pre-evaluated transpose flow graphs for constraint violations.
      * <p/>
-     * Evaluates all transpose flow graphs and checks each provided constraint against them,
+     * Checks each provided constraint against the evaluated graphs,
      * returning a flat list of all violations found as {@link ViolationTuple} objects.
      * Returns an empty list if no constraints are provided.
-     * @param complete DFD / DD combination to analyze
+     * @param evaluatedGraphs Pre-evaluated list of transpose flow graphs
      * @param constraints List of constraints to check, may be null or empty
-     * @param finderClass Custom TFG finder class (optional)
      * @return List of {@link ViolationTuple} objects, each pairing a violated constraint with its result
      */
-    public List<ViolationTuple> analyzeViolations(DataFlowDiagramAndDictionary complete, 
-                                                 List<AnalysisConstraint> constraints, 
-                                                 Class<? extends TransposeFlowGraphFinder> finderClass) {
+    public List<ViolationTuple> analyzeViolations(List<? extends AbstractTransposeFlowGraph> evaluatedGraphs,
+                                                  List<AnalysisConstraint> constraints) {
         if (constraints == null || constraints.isEmpty()) {
             return new ArrayList<>();
         }
-
-        var evaluatedGraphs = getTransposeFlowGraphs(complete, finderClass).stream()
-                .map(AbstractTransposeFlowGraph::evaluate)
-                .toList();
 
         var collection = new DFDFlowGraphCollection(null, evaluatedGraphs);
 
         return constraints.stream()
                 .flatMap(constraint -> constraint.findViolations(collection).stream()
-                        .map(result -> {
-                        	return new ViolationTuple(constraint, result);}
-                        ))
+                        .map(result -> new ViolationTuple(constraint, result)))
                 .collect(Collectors.toList());
     }
 
@@ -209,7 +200,7 @@ public class DFD2WebConverter extends Converter {
 
         return annotations;
     }
-    
+
     private static List<? extends AbstractTransposeFlowGraph> getTransposeFlowGraphs(DataFlowDiagramAndDictionary complete,
             Class<? extends TransposeFlowGraphFinder> finderClass) {
         TransposeFlowGraphFinder finder;
@@ -220,7 +211,6 @@ public class DFD2WebConverter extends Converter {
                 finder = new DFDSimpleTransposeFlowGraphFinder(complete.dataDictionary(), complete.dataFlowDiagram());
             else
                 finder = new DFDTransposeFlowGraphFinder(complete.dataDictionary(), complete.dataFlowDiagram());
-
         }
         return finder.findTransposeFlowGraphs();
     }
@@ -247,13 +237,13 @@ public class DFD2WebConverter extends Converter {
         createFlows(dataFlowDiagram, children);
 
         createNodes(dataFlowDiagram, children, mapNodeToAnnotation);
-        
+
         // Convert violation tuples into web editor violation objects for the output model
         List<Violation> webViolations = createViolations(violationTuples);
-        
+
         return new WebEditorDfd(new Model("graph", "root", children), labelTypes, readOnly ? "view" : "edit", new ArrayList<>(), webViolations);
     }
-    
+
     /**
      * Converts a list of {@link ViolationTuple} objects into {@link Violation} objects
      * for use in the web editor format.
@@ -265,48 +255,47 @@ public class DFD2WebConverter extends Converter {
      *         and inducing vertex information
      */
     private List<Violation> createViolations(List<ViolationTuple> violationTuples) {
-    	List<Violation> violations = violationTuples.stream()
+        List<Violation> violations = violationTuples.stream()
                 .map(tuple -> {
-                	DSLResult result = tuple.result();
-                	AnalysisConstraint constraint = tuple.constraint();
-                	
-                	List<? extends AbstractVertex<?>> violatedVertices = result.getMatchedVertices(); 
-                	List<? extends AbstractVertex<?>> tfg = result.getTransposeFlowGraph().getVertices();
-                	
-                	List<AbstractSelector> selectors = constraint.getDataSourceSelectors().getSelectors();
-                	List<AbstractVertex<?>> inducingVertices = new ArrayList<>();
-                	
-                	for (AbstractSelector selector : selectors) {
-                		for (AbstractVertex<?> vertex : tfg) {
-                			boolean isNewlyAdded = ((DataCharacteristicsSelector) selector).isAddedToCharacteristics(vertex);
-                			if (isNewlyAdded) {
-                				inducingVertices.add(vertex);
-                			}
-                		}
-                	}
-                	
-                	logger.info("violation found: " + 
-                			"\nconstaint " + constraint.toString() + 
-                			"\ntfg " + tfg.toString() +
-                			"\nviolated " + violatedVertices +
-                			"\ninducing " + inducingVertices.toString());
-                	
-                	return new Violation(
-                		    constraint.toString(),
-                		    tfg.stream()
-	                		    .map(v -> ((Node) v.getReferencedElement()).getEntityName())
-	                		    .collect(Collectors.toList()),
-	                		violatedVertices.stream()
-	                		    .map(v -> ((Node) v.getReferencedElement()).getEntityName())
-	                		    .collect(Collectors.toList()),
-	                		inducingVertices.stream()
-	                		    .map(v -> ((Node) v.getReferencedElement()).getEntityName())
-	                		    .collect(Collectors.toList())
-                		);
-                }
-               )
+                    DSLResult result = tuple.result();
+                    AnalysisConstraint constraint = tuple.constraint();
+
+                    List<? extends AbstractVertex<?>> violatedVertices = result.getMatchedVertices();
+                    List<? extends AbstractVertex<?>> tfg = result.getTransposeFlowGraph().getVertices();
+
+                    List<AbstractSelector> selectors = constraint.getDataSourceSelectors().getSelectors();
+                    List<AbstractVertex<?>> inducingVertices = new ArrayList<>();
+
+                    for (AbstractSelector selector : selectors) {
+                        for (AbstractVertex<?> vertex : tfg) {
+                            boolean isNewlyAdded = ((DataCharacteristicsSelector) selector).isAddedToCharacteristics(vertex);
+                            if (isNewlyAdded) {
+                                inducingVertices.add(vertex);
+                            }
+                        }
+                    }
+
+                    logger.info("violation found: " +
+                            "\nconstaint " + constraint.toString() +
+                            "\ntfg " + tfg.toString() +
+                            "\nviolated " + violatedVertices +
+                            "\ninducing " + inducingVertices.toString());
+
+                    return new Violation(
+                            constraint.toString(),
+                            tfg.stream()
+                                    .map(v -> ((Node) v.getReferencedElement()).getEntityName())
+                                    .collect(Collectors.toList()),
+                            violatedVertices.stream()
+                                    .map(v -> ((Node) v.getReferencedElement()).getEntityName())
+                                    .collect(Collectors.toList()),
+                            inducingVertices.stream()
+                                    .map(v -> ((Node) v.getReferencedElement()).getEntityName())
+                                    .collect(Collectors.toList())
+                    );
+                })
                 .toList();
-    	return violations;
+        return violations;
     }
 
     private void createNodes(DataFlowDiagram dataFlowDiagram, List<Child> children, Map<Node, List<Annotation>> mapNodeToAnnotation) {
